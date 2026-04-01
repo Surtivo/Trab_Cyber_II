@@ -1,0 +1,162 @@
+from scapy.all import *
+import logging
+import threading
+import time
+from datetime import datetime
+
+# ---------------- CONFIG ----------------
+MALWARE_IP = "10.0.0.2"   # gateway (fake internet)
+VICTIM_IP = "10.0.0.1"
+INTERFACE = "enp0s3"
+
+connections = {}
+
+# ---------------- LOG ----------------
+logging.basicConfig(
+    filename="gateway.log",
+    level=logging.INFO,
+    format="%(message)s"
+)
+
+def log(msg):
+    print(msg)
+    logging.info(msg)
+
+def timestamp():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# ---------------- HEARTBEAT ----------------
+def heartbeat():
+    while True:
+        print("🟢 Script rodando...")
+        time.sleep(5)
+
+threading.Thread(target=heartbeat, daemon=True).start()
+
+# ---------------- DNS ----------------
+def handle_dns(pkt):
+    if pkt.haslayer(DNSQR) and pkt.haslayer(IP):
+
+        if pkt[IP].src != VICTIM_IP:
+            return
+
+        domain = pkt[DNSQR].qname.decode(errors="ignore")
+
+        ip_fake = MALWARE_IP
+
+        log(f"{timestamp()} | DNS_QUERY | SRC={pkt[IP].src} | DOMAIN={domain} | RESOLVED={ip_fake}")
+
+        resp = IP(dst=pkt[IP].src, src=pkt[IP].dst) / \
+               UDP(dport=pkt[UDP].sport, sport=53) / \
+               DNS(
+                   id=pkt[DNS].id,
+                   qr=1,
+                   aa=1,
+                   qd=pkt[DNS].qd,
+                   an=DNSRR(rrname=domain, ttl=60, rdata=ip_fake)
+               )
+
+        send(resp, verbose=0)
+
+# ---------------- ICMP ----------------
+def handle_icmp(pkt):
+    if pkt.haslayer(ICMP) and pkt.haslayer(IP):
+
+        if pkt[IP].src != VICTIM_IP:
+            return
+
+        if pkt[ICMP].type == 8:  # Echo Request
+
+            log(f"{timestamp()} | ICMP_PING | SRC={pkt[IP].src} -> DST={pkt[IP].dst}")
+
+            ip = IP(dst=pkt[IP].src, src=pkt[IP].dst)
+            icmp = ICMP(type=0, id=pkt[ICMP].id, seq=pkt[ICMP].seq)
+
+            data = b""
+            if pkt.haslayer(Raw):
+                data = pkt[Raw].load
+
+            send(ip / icmp / data, verbose=0)
+
+# ---------------- TCP ----------------
+def handle_tcp(pkt):
+    if pkt.haslayer(TCP) and pkt.haslayer(IP):
+
+        if pkt[IP].src != VICTIM_IP:
+            return
+
+        src_ip = pkt[IP].src
+        dst_ip = pkt[IP].dst
+        sport = pkt[TCP].sport
+        dport = pkt[TCP].dport
+
+        # SYN
+        if pkt[TCP].flags == "S":
+
+            log(f"{timestamp()} | TCP_SYN | {src_ip}:{sport} -> {dst_ip}:{dport}")
+
+            connections[dst_ip] = connections.get(dst_ip, 0) + 1
+
+            ip = IP(dst=src_ip, src=dst_ip)
+            tcp = TCP(
+                sport=dport,
+                dport=sport,
+                flags="SA",
+                seq=1000,
+                ack=pkt[TCP].seq + 1
+            )
+
+            send(ip / tcp, verbose=0)
+
+        # ACK + possível HTTP
+        elif pkt[TCP].flags == "A":
+
+            if pkt.haslayer(Raw):
+                payload = pkt[Raw].load
+
+                try:
+                    data = payload.decode(errors="ignore")
+
+                    if "HTTP" in data:
+                        log(f"{timestamp()} | HTTP_REQ | {src_ip} -> {dst_ip}:{dport}")
+
+                        http_resp = (
+                            "HTTP/1.1 200 OK\r\n"
+                            "Content-Type: text/html\r\n"
+                            "Content-Length: 2\r\n"
+                            "\r\n"
+                            "OK"
+                        ).encode()
+
+                        ip = IP(dst=src_ip, src=dst_ip)
+                        tcp = TCP(
+                            sport=dport,
+                            dport=sport,
+                            flags="PA",
+                            seq=pkt[TCP].ack,
+                            ack=pkt[TCP].seq + len(payload)
+                        )
+
+                        send(ip / tcp / http_resp, verbose=0)
+
+                except:
+                    pass
+
+# ---------------- HANDLER ----------------
+def packet_handler(pkt):
+    if pkt.haslayer(DNSQR):
+        handle_dns(pkt)
+    elif pkt.haslayer(ICMP):
+        handle_icmp(pkt)
+    elif pkt.haslayer(TCP):
+        handle_tcp(pkt)
+
+# ---------------- START ----------------
+print("🚀 Gateway fake internet iniciado...")
+
+sniff(
+    iface=INTERFACE,
+    filter="udp port 53 or tcp or icmp",
+    prn=packet_handler,
+    store=0
+)
