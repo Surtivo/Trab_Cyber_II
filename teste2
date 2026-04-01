@@ -1,0 +1,117 @@
+from scapy.all import *
+import logging
+import random
+import threading
+import time
+from datetime import datetime
+
+# ---------------- CONFIG ----------------
+MALWARE_IP = "10.0.0.2"
+INTERFACE = "enp0s3"  # ALTERE se necessário
+
+dns_map = {}
+connections = {}
+
+# ---------------- LOG ----------------
+logging.basicConfig(
+    filename="gateway.log",
+    level=logging.INFO,
+    format="%(message)s"
+)
+
+def log(msg):
+    print(msg)
+    logging.info(msg)
+
+def timestamp():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def fake_ip():
+    return f"10.0.0.{random.randint(100,200)}"
+
+# ---------------- HEARTBEAT ----------------
+def heartbeat():
+    while True:
+        print("🟢 Script rodando...")
+        time.sleep(5)
+
+threading.Thread(target=heartbeat).start()
+
+# ---------------- DNS ----------------
+def handle_dns(pkt):
+    if pkt.haslayer(DNSQR) and pkt.haslayer(IP):
+
+        if pkt[IP].src != MALWARE_IP:
+            return
+
+        domain = pkt[DNSQR].qname.decode(errors="ignore")
+
+        if domain not in dns_map:
+            dns_map[domain] = fake_ip()
+
+        ip_fake = dns_map[domain]
+
+        log(f"{timestamp()} | DNS_QUERY | SRC={pkt[IP].src} | DOMAIN={domain} | RESOLVED={ip_fake}")
+
+        # resposta DNS
+        resp = IP(dst=pkt[IP].src, src=pkt[IP].dst) / \
+               UDP(dport=pkt[UDP].sport, sport=53) / \
+               DNS(
+                   id=pkt[DNS].id,
+                   qr=1,
+                   aa=1,
+                   qd=pkt[DNS].qd,
+                   an=DNSRR(rrname=domain, ttl=60, rdata=ip_fake)
+               )
+
+        send(resp, verbose=0)
+
+# ---------------- TCP ----------------
+def handle_tcp(pkt):
+    if pkt.haslayer(TCP) and pkt.haslayer(IP):
+
+        if pkt[IP].src != MALWARE_IP:
+            return
+
+        # SYN
+        if pkt[TCP].flags == "S":
+
+            dst_ip = pkt[IP].dst
+            dst_port = pkt[TCP].dport
+
+            log(f"{timestamp()} | TCP_CONNECT | SRC={pkt[IP].src} | DST={dst_ip}:{dst_port}")
+
+            # contagem para comportamento suspeito
+            connections[dst_ip] = connections.get(dst_ip, 0) + 1
+
+            if connections[dst_ip] > 5:
+                print(f"⚠ Possível comportamento suspeito: {dst_ip}")
+
+            # resposta SYN-ACK
+            ip = IP(dst=pkt[IP].src, src=dst_ip)
+            tcp = TCP(
+                sport=dst_port,
+                dport=pkt[TCP].sport,
+                flags="SA",
+                seq=1000,
+                ack=pkt[TCP].seq + 1
+            )
+
+            send(ip / tcp, verbose=0)
+
+# ---------------- HANDLER ----------------
+def packet_handler(pkt):
+    if pkt.haslayer(DNSQR):
+        handle_dns(pkt)
+    elif pkt.haslayer(TCP):
+        handle_tcp(pkt)
+
+# ---------------- SNIFF ----------------
+print("🚀 Gateway iniciado...")
+
+sniff(
+    iface=INTERFACE,
+    filter="udp port 53 or tcp",
+    prn=packet_handler,
+    store=0
+)
