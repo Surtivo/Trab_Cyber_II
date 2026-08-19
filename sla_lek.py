@@ -1,4 +1,3 @@
-sla, kej
 from scapy.all import rdpcap, DNSQR, DNS, IP, ICMP, TCP, UDP
 from collections import defaultdict
 from datetime import datetime
